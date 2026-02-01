@@ -26,7 +26,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 # ------------------ CONFIGURATION ------------------
 BOT_TOKEN = '8595445360:AAGDS1yg-jFEAyQUUfsWZo27WGZ-dgFcn7I'
-PRIMARY_ADMIN_USERNAME = 'akinzoak'
+PRIMARY_ADMIN_USERNAME = 'allicheamine2'
 
 # ------------------ PATHS ------------------
 BASE_DIR = Path(__file__).resolve().parent
