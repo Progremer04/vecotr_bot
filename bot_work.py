@@ -105,7 +105,11 @@ DEFAULT_BOT_CONFIG = {
     # Controls the time period over which the request limit applies.
     "request_window_seconds": 600,
     # Optional per‑service claim limit overrides (in hours). Empty dict by default.
-    "service_claim_limit_hours": {}
+    "service_claim_limit_hours": {},
+    # Log channel for claim notifications (optional). Set via admin settings.
+    "log_channel": None,
+    # Claim notification settings: "admins", "log_channel", "both", or "none"
+    "claim_notification_mode": "admins"
 }
 
 # ------------------ FILE-BASED DATA MANAGEMENT ------------------
@@ -703,6 +707,67 @@ def can_user_claim_service(user_id: str, service_key: str) -> tuple[bool, int]:
         logger.error(f"Error determining claim limit for user {user_id} and service {service_key}: {e}")
         return True, 0
 
+# ------------------ CLAIM NOTIFICATION SYSTEM ------------------
+async def send_claim_notification(user_id: str, username: str, service_key: str, account_name: str, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Send notification when a user claims an account.
+    Notifications can be sent to admins, a log channel, both, or none based on config.
+    """
+    try:
+        notification_mode = bot_config.get('claim_notification_mode', 'admins')
+        
+        if notification_mode == 'none':
+            return
+        
+        # Get service display name
+        service_name = services.get(service_key, {}).get('text', service_key)
+        
+        # Format the notification message
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        user_display = format_username_display(username) if username else f"User {user_id}"
+        user_link = format_user_link(user_id, username)
+        
+        notification_message = (
+            f"\U0001F4E6 <b>Account Claimed</b>\n\n"
+            f"\U0001F464 <b>User:</b> {user_link}\n"
+            f"\U0001F194 <b>User ID:</b> <code>{user_id}</code>\n"
+            f"\U0001F4F1 <b>Service:</b> {html.escape(service_name)}\n"
+            f"\U0001F4DD <b>Account:</b> <code>{html.escape(account_name[:100])}{'...' if len(account_name) > 100 else ''}</code>\n"
+            f"\U0001F552 <b>Time:</b> {timestamp}"
+        )
+        
+        # Send to admins if mode is 'admins' or 'both'
+        if notification_mode in ['admins', 'both']:
+            for admin_id in admin_user_ids:
+                try:
+                    await safe_send_message(
+                        admin_id,
+                        notification_message,
+                        context,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send claim notification to admin {admin_id}: {e}")
+        
+        # Send to log channel if mode is 'log_channel' or 'both'
+        if notification_mode in ['log_channel', 'both']:
+            log_channel = bot_config.get('log_channel')
+            if log_channel and log_channel.get('chat_id'):
+                try:
+                    await safe_send_message(
+                        log_channel['chat_id'],
+                        notification_message,
+                        context,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send claim notification to log channel: {e}")
+        
+        logger.info(f"Claim notification sent for user {user_id} claiming {service_key}")
+        
+    except Exception as e:
+        logger.error(f"Error sending claim notification: {e}")
+
 # ------------------ USERNAME DISPLAY HELPER FUNCTIONS ------------------
 def is_fallback_username(username: str) -> bool:
     """
@@ -833,6 +898,11 @@ def check_user_premium_status(user_id):
             logger.error(f"Invalid premium_until date format for user {user_id_str}: {premium_until}")
 
     return False, None
+
+def is_user_premium(user_id):
+    """Helper function to check if a user has premium status."""
+    is_premium, _ = check_user_premium_status(user_id)
+    return is_premium
 
 def update_user_premium_status(user_id, username, key_type, days_override=None):
     user_id_str = str(user_id)
@@ -4663,10 +4733,100 @@ async def cancel_key_redemption(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 # ------------------ POINTS TRANSFER SYSTEM ------------------
+async def verify_transfer_participant(user_id: int, context: ContextTypes.DEFAULT_TYPE, reason: str = "transfer") -> bool:
+    """Check if a user is in required channels. If not, ban them and return False."""
+    if is_admin(user_id):
+        return True
+
+    channels = bot_config.get("channels", [])
+    if not channels:
+        return True
+
+    all_joined = True
+    failed_channels = []
+
+    for channel in channels:
+        ch_id_str = channel.get("chat_id")
+        ch_username = channel.get("username", "").lstrip('@')
+        if not ch_id_str:
+            continue
+        try:
+            ch_id = int(ch_id_str)
+            member_status = await context.bot.get_chat_member(ch_id, user_id)
+            if member_status.status not in ["member", "administrator", "creator"]:
+                all_joined = False
+                failed_channels.append(ch_username or f"ID: {ch_id}")
+        except Exception as e:
+            logger.error(f"Error checking membership for user {user_id} in channel {ch_id_str}: {e}")
+            all_joined = False
+            failed_channels.append(ch_username or f"ID: {ch_id}")
+
+    if not all_joined:
+        # Ban the user
+        user_id_str = str(user_id)
+        users_data = load_json(USERS_JSON_FILE)
+        user_info = users_data.get(user_id_str, {})
+        username = user_info.get('username', f"user{user_id_str}")
+        
+        # Apply permanent ban
+        permanent_bans.add(user_id_str)
+        save_json(PERMANENT_BANS_FILE, list(permanent_bans))
+        
+        logger.warning(f"User {username} (ID: {user_id}) banned for not joining channels during {reason}.")
+        
+        # Notify user
+        try:
+            await safe_send_message(
+                user_id,
+                "🚫 <b>You was kiked from bot because of fake transfat</b>\n\n"
+                "Your account has been banned. All participants must be members of the required channels to perform this action.",
+                context,
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass
+
+        # Notify Admins for decision
+        admin_notif = (
+            "🚨 <b>New Automatic Ban</b>\n\n"
+            f"<b>User:</b> {username}\n"
+            f"<b>ID:</b> <code>{user_id_str}</code>\n"
+            f"<b>Reason:</b> Not in required channels during {reason}.\n\n"
+            "Please decide if you want to unban this user using the Admin Panel."
+        )
+        for admin_id in admin_user_ids:
+            try:
+                await safe_send_message(admin_id, admin_notif, context, parse_mode=ParseMode.HTML)
+            except:
+                pass
+            
+        return False
+    return True
+
 async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if not user:
         return ConversationHandler.END
+
+    # Check if sender is in channels
+    if not await verify_transfer_participant(user.id, context):
+        return ConversationHandler.END
+
+    # Check if user is premium
+    #if not is_user_premium(user.id):
+    #    await safe_send_message(
+    #        user.id,
+    #        "💎 <b>Premium Feature</b>\n\n"
+    #        "Point transfers are only available for premium users.\n\n"
+    #        "Upgrade to premium to unlock this feature and enjoy:\n"
+    #        "• Transfer points to other users\n"
+    #        "• Reduced cooldowns\n"
+    #        "• Higher request limits\n\n"
+    #        "Use /redeem with a premium key to upgrade!",
+    #        context,
+    #        parse_mode=ParseMode.HTML
+    #    )
+    #    return ConversationHandler.END
 
     context.user_data['transfer_state'] = 'awaiting_recipient'
 
@@ -4711,6 +4871,16 @@ async def get_transfer_recipient(update: Update, context: ContextTypes.DEFAULT_T
         )
         return 1
 
+    # Check if recipient is in channels
+    if not await verify_transfer_participant(int(recipient_id), context):
+        await safe_send_message(
+            user.id,
+            f"❌ Cannot transfer to {recipient_username}. The recipient is not a member of the required channels and has been banned.",
+            context,
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+
     context.user_data['transfer_recipient_id'] = recipient_id
     context.user_data['transfer_recipient_username'] = recipient_username
     context.user_data['transfer_state'] = 'awaiting_amount'
@@ -4749,6 +4919,13 @@ async def get_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         recipient_id = context.user_data.get('transfer_recipient_id')
         recipient_username = context.user_data.get('transfer_recipient_username')
+
+        # Final membership check for both sender and receiver
+        if not await verify_transfer_participant(user.id, context, reason="transfer"):
+            return ConversationHandler.END
+        if not await verify_transfer_participant(int(recipient_id), context, reason="transfer"):
+            await safe_send_message(user.id, f"❌ Transfer failed. The recipient ({recipient_username}) has been banned for not being in required channels.", context, parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
 
         update_user_points(user.id, user.username, -amount)
         update_user_points(recipient_id, recipient_username, amount)
@@ -5034,6 +5211,10 @@ async def handle_service_selection(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
+    # Membership check before allowing purchase
+    if not await verify_transfer_participant(user.id, context, reason="service purchase"):
+        return
+
     service_key = query.data.split('_', 1)[1]
     user_points = get_user_points(user.id)
     service_price = get_service_price(service_key)
@@ -5114,6 +5295,9 @@ async def handle_service_selection(update: Update, context: ContextTypes.DEFAULT
         return
 
     log_claimed_account(str(user.id), username, service_key, account_content)
+    
+    # Send claim notification to admins/log channel
+    await send_claim_notification(str(user.id), username, service_key, account_content, context)
 
     users_data = load_json(USERS_JSON_FILE)
     if str(user.id) in users_data:
@@ -6526,6 +6710,8 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
                 [InlineKeyboardButton("Manage Admins", callback_data="admin_manage_admins")],
                 [InlineKeyboardButton("Manage Channels", callback_data="admin_manage_channels")],
                 [InlineKeyboardButton("Low Stock Threshold", callback_data="admin_low_stock_threshold")],
+                [InlineKeyboardButton("📋 Log Channel Settings", callback_data="admin_log_channel_settings")],
+                [InlineKeyboardButton("🔔 Claim Notifications", callback_data="admin_claim_notifications")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_panel_main")]
             ])
 
@@ -6603,6 +6789,87 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         elif action == "admin_remove_admin_prompt":
             context.user_data.update({'awaiting_admin_input': 'remove_admin_id', 'return_to_menu': 'admin_manage_admins'})
             message_text = f"Enter the Telegram User ID of the admin to remove.\nOr /cancel_admin"
+
+        elif action == "admin_log_channel_settings":
+            log_channel = bot_config.get('log_channel')
+            if log_channel and log_channel.get('chat_id'):
+                channel_info = f"\n\n<b>Current Log Channel:</b>\n"
+                channel_info += f"\u2022 Username: {log_channel.get('username', 'N/A')}\n"
+                channel_info += f"\u2022 Chat ID: <code>{log_channel.get('chat_id')}</code>"
+            else:
+                channel_info = "\n\n<b>No log channel configured.</b>"
+            
+            message_text = f"\U0001F4CB <b>Log Channel Settings</b>{channel_info}\n\nThe log channel receives claim notifications when notification mode is set to 'log_channel' or 'both'."
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u2795 Set Log Channel", callback_data="admin_set_log_channel")],
+                [InlineKeyboardButton("\U0001F5D1\ufe0f Remove Log Channel", callback_data="admin_remove_log_channel")],
+                [InlineKeyboardButton("\u2b05\ufe0f Back to Bot Settings", callback_data="admin_bot_settings_menu")]
+            ])
+
+        elif action == "admin_set_log_channel":
+            context.user_data['awaiting_admin_input'] = 'set_log_channel'
+            context.user_data['return_to_menu'] = 'admin_log_channel_settings'
+            message_text = ("\U0001F4CB <b>Set Log Channel</b>\n\n"
+                           "Send the channel info in one of these formats:\n\n"
+                           "1. Forward a message from the channel\n"
+                           "2. Type: <code>@username chat_id</code>\n"
+                           "   Example: <code>@mylogchannel -1001234567890</code>\n"
+                           "3. Just the chat ID: <code>-1001234567890</code>\n\n"
+                           "<i>Make sure the bot is an admin in the channel!</i>\n\n"
+                           "Or /cancel_admin")
+
+        elif action == "admin_remove_log_channel":
+            log_channel = bot_config.get('log_channel')
+            if log_channel:
+                bot_config['log_channel'] = None
+                save_config()
+                message_text = "\u2705 <b>Log channel removed successfully!</b>"
+            else:
+                message_text = "\u26a0\ufe0f <b>No log channel was configured.</b>"
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u2b05\ufe0f Back to Log Channel Settings", callback_data="admin_log_channel_settings")]
+            ])
+
+        elif action == "admin_claim_notifications":
+            current_mode = bot_config.get('claim_notification_mode', 'admins')
+            mode_descriptions = {
+                'admins': '\U0001F464 Admins Only - Notifications sent to all admins',
+                'log_channel': '\U0001F4E2 Log Channel Only - Notifications sent to log channel',
+                'both': '\U0001F501 Both - Notifications sent to admins AND log channel',
+                'none': '\U0001F515 Disabled - No claim notifications'
+            }
+            current_desc = mode_descriptions.get(current_mode, 'Unknown')
+            
+            message_text = (f"\U0001F514 <b>Claim Notification Settings</b>\n\n"
+                           f"<b>Current Mode:</b> {current_mode}\n"
+                           f"<i>{current_desc}</i>\n\n"
+                           f"When a user claims an account, notifications will be sent based on this setting.\n\n"
+                           f"Select a notification mode:")
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001F464 Admins Only" + (" \u2705" if current_mode == 'admins' else ""), callback_data="admin_set_notif_mode_admins")],
+                [InlineKeyboardButton("\U0001F4E2 Log Channel Only" + (" \u2705" if current_mode == 'log_channel' else ""), callback_data="admin_set_notif_mode_log_channel")],
+                [InlineKeyboardButton("\U0001F501 Both" + (" \u2705" if current_mode == 'both' else ""), callback_data="admin_set_notif_mode_both")],
+                [InlineKeyboardButton("\U0001F515 Disabled" + (" \u2705" if current_mode == 'none' else ""), callback_data="admin_set_notif_mode_none")],
+                [InlineKeyboardButton("\u2b05\ufe0f Back to Bot Settings", callback_data="admin_bot_settings_menu")]
+            ])
+
+        elif action.startswith("admin_set_notif_mode_"):
+            new_mode = action.replace("admin_set_notif_mode_", "")
+            valid_modes = ['admins', 'log_channel', 'both', 'none']
+            if new_mode in valid_modes:
+                bot_config['claim_notification_mode'] = new_mode
+                save_config()
+                mode_names = {'admins': 'Admins Only', 'log_channel': 'Log Channel Only', 'both': 'Both', 'none': 'Disabled'}
+                message_text = f"\u2705 <b>Notification mode updated to: {mode_names.get(new_mode, new_mode)}</b>"
+                
+                # Warn if log_channel mode is set but no channel configured
+                if new_mode in ['log_channel', 'both'] and not bot_config.get('log_channel'):
+                    message_text += "\n\n\u26a0\ufe0f <b>Warning:</b> No log channel is configured! Please set one in Log Channel Settings."
+            else:
+                message_text = "\u274c <b>Invalid notification mode.</b>"
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u2b05\ufe0f Back to Claim Notifications", callback_data="admin_claim_notifications")]
+            ])
 
         elif action == "admin_settings_points":
             message_text = (f"💰 <b>Points Configuration</b>\n\n"
@@ -6892,6 +7159,10 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
 
         elif action == "user_live_stocks":
             await user_live_stocks(update, context)
+            return
+
+        elif action == "admin_check_user_points_calculation":
+            await admin_check_user_points_calculation(update, context)
             return
 
         else:
@@ -7567,6 +7838,53 @@ async def handle_admin_message_input(update: Update, context: ContextTypes.DEFAU
             except Exception as e_addch:
                 logger.error(f"Error adding channel: {e_addch}")
                 response_message = "An error occurred."
+
+    elif state == 'set_log_channel':
+        if not text_input and not update.message.forward_from_chat:
+            response_message = "Please forward a message from the channel or provide channel info."
+        else:
+            try:
+                if update.message.forward_from_chat:
+                    channel = update.message.forward_from_chat
+                    ch_username = f"@{channel.username}" if channel.username else f"Private Channel"
+                    ch_chat_id = channel.id
+
+                    bot_config['log_channel'] = {
+                        'username': ch_username,
+                        'chat_id': ch_chat_id
+                    }
+                    save_config()
+                    response_message = f"\u2705 Log channel set to '{ch_username}' (ID: {ch_chat_id})"
+
+                elif text_input:
+                    # Try to parse as just a chat ID first
+                    text_input = text_input.strip()
+                    if text_input.lstrip('-').isdigit():
+                        ch_chat_id = int(text_input)
+                        ch_username = "Log Channel"
+                    else:
+                        # Parse as @username chat_id
+                        parts = text_input.split()
+                        if len(parts) >= 2:
+                            ch_username = parts[0] if parts[0].startswith('@') else f"@{parts[0]}"
+                            ch_chat_id = int(parts[1])
+                        else:
+                            response_message = "Format: @username chat_id or just chat_id"
+                            raise ValueError("Invalid format")
+
+                    bot_config['log_channel'] = {
+                        'username': ch_username,
+                        'chat_id': ch_chat_id
+                    }
+                    save_config()
+                    response_message = f"\u2705 Log channel set to '{ch_username}' (ID: {ch_chat_id})"
+
+            except ValueError as ve:
+                if not response_message:
+                    response_message = f"Format error: {str(ve)}. Use @username chat_id or just chat_id"
+            except Exception as e_setlog:
+                logger.error(f"Error setting log channel: {e_setlog}")
+                response_message = "An error occurred while setting log channel."
 
     elif state == 'ban_user_manual' or state == 'unban_user_manual':
         if not text_input:
