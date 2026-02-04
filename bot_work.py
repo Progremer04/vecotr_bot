@@ -547,6 +547,10 @@ def check_and_ban_user(username: str, user_id_for_premium_check: int = None, unb
     else:
         logger.warning(f"No user_id provided for {username} in check_and_ban_user. Assuming non-premium for rate limits.")
 
+    # Prime users are exempt from cooldown/rate limiting
+    if is_premium:
+        return False
+
     current_time = time.time()
     # Use configurable request window for rate limiting (default 600 seconds = 10 minutes)
     request_window = bot_config.get("request_window_seconds", DEFAULT_BOT_CONFIG.get("request_window_seconds", 600))
@@ -4794,11 +4798,21 @@ async def verify_transfer_participant(user_id: int, context: ContextTypes.DEFAUL
             f"<b>Reason:</b> Not in required channels during {reason}.\n\n"
             "Please decide if you want to unban this user using the Admin Panel."
         )
+        
+        # Send to Admins
         for admin_id in admin_user_ids:
             try:
                 await safe_send_message(admin_id, admin_notif, context, parse_mode=ParseMode.HTML)
             except:
                 pass
+        
+        # Send to Logs Channel
+        log_channel = bot_config.get('log_channel')
+        if log_channel and log_channel.get('chat_id'):
+            try:
+                await safe_send_message(log_channel['chat_id'], admin_notif, context, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Failed to send ban notification to log channel: {e}")
             
         return False
     return True
@@ -4812,21 +4826,22 @@ async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await verify_transfer_participant(user.id, context):
         return ConversationHandler.END
 
-    # Check if user is premium
-    #if not is_user_premium(user.id):
-    #    await safe_send_message(
-    #        user.id,
-    #        "💎 <b>Premium Feature</b>\n\n"
-    #        "Point transfers are only available for premium users.\n\n"
-    #        "Upgrade to premium to unlock this feature and enjoy:\n"
-    #        "• Transfer points to other users\n"
-    #        "• Reduced cooldowns\n"
-    #        "• Higher request limits\n\n"
-    #        "Use /redeem with a premium key to upgrade!",
-    #        context,
-    #        parse_mode=ParseMode.HTML
-    #    )
-    #    return ConversationHandler.END
+    # Check if user is Prime
+    if not is_user_premium(user.id):
+        await safe_send_message(
+            user.id,
+            "💎 <b>Premium Feature</b>\n\n"
+            "Point transfers are exclusively available for <b>Premium</b> users.\n\n"
+            "Upgrade to Premium and unlock these features to enjoy:\n"
+            "• Transfer points to other users\n"
+            "• <b>No cooldowns</b> on actions\n"
+            "• Higher request limits\n\n"
+            " Use /redeem with a premium key to upgrade your status!\n\n"
+            "You can upgrade to <b>Premium</b> by contacting <b>@akinzoak</b> or <b>@akinzoakBot</b>",
+            context,
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
 
     context.user_data['transfer_state'] = 'awaiting_recipient'
 
@@ -5205,7 +5220,11 @@ async def handle_service_selection(update: Update, context: ContextTypes.DEFAULT
         # Inform the user about temporary restriction due to high request volume
         await safe_send_message(
             user.id,
-            f"⛔ Restricted for {ban_duration_msg}s due to excessive requests.",
+            f"⛔ <b>Cooldown Active!</b>\n\n"
+            f"You are restricted for {ban_duration_msg}s due to high-frequency requests.\n\n"
+            f"💎 <b>Want to skip cooldowns?</b>\n"
+            f"Upgrade to <b>Prime Status</b> to enjoy unlimited actions without waiting!\n"
+            f"Use /redeem with a premium key to upgrade now.",
             context,
             parse_mode=ParseMode.HTML
         )
@@ -5234,8 +5253,11 @@ async def handle_service_selection(update: Update, context: ContextTypes.DEFAULT
         return
 
     # Enforce claim cooldown per service
+    is_premium_user, _ = check_user_premium_status(user.id)
     can_claim, wait_secs = can_user_claim_service(str(user.id), service_key)
-    if not can_claim:
+    
+    # Premium users are exempt from claim cooldowns
+    if not can_claim and not is_premium_user:
         # Format wait time into hours/minutes/seconds
         hrs = wait_secs // 3600
         mins = (wait_secs % 3600) // 60
@@ -5248,7 +5270,7 @@ async def handle_service_selection(update: Update, context: ContextTypes.DEFAULT
             wait_str = f"{secs}s"
         await safe_send_message(
             query.message.chat_id,
-            f"⏳ You must wait {wait_str} before claiming another {service_info['text']} account.",
+            f"⏳ You must wait {wait_str} before claiming another {service_info['text']} account. \n\n You can upgrade to Premium by contacting @akinzoak or @akinzoakBot",
             context,
             parse_mode=ParseMode.HTML
         )
@@ -6208,14 +6230,37 @@ async def notify_admin_low_stock(service_key: str, remaining_stock: int, context
         # Send to all admins
         for admin_id in admin_user_ids:
             try:
-                await safe_send_message(
+                sent_msg = await safe_send_message(
                     admin_id,
                     message,
                     context,
                     parse_mode=ParseMode.HTML
                 )
+                if sent_msg:
+                    try:
+                        await context.bot.pin_chat_message(chat_id=admin_id, message_id=sent_msg.message_id)
+                    except Exception as pe:
+                        logger.error(f"Failed to pin low stock alert for admin {admin_id}: {pe}")
             except Exception as e:
                 logger.error(f"Failed to send low stock alert to admin {admin_id}: {e}")
+
+        # Send to logs channel
+        log_channel = bot_config.get('log_channel')
+        if log_channel and log_channel.get('chat_id'):
+            try:
+                sent_msg = await safe_send_message(
+                    log_channel['chat_id'],
+                    message,
+                    context,
+                    parse_mode=ParseMode.HTML
+                )
+                if sent_msg:
+                    try:
+                        await context.bot.pin_chat_message(chat_id=log_channel['chat_id'], message_id=sent_msg.message_id)
+                    except Exception as pe:
+                        logger.error(f"Failed to pin low stock alert in logs channel: {pe}")
+            except Exception as e:
+                logger.error(f"Failed to send low stock alert to log channel: {e}")
 
     except Exception as e:
         logger.error(f"Error preparing low stock notification for {service_key}: {e}")
