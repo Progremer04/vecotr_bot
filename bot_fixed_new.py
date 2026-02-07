@@ -2245,11 +2245,20 @@ def add_accounts_to_service(service_key: str, accounts_list):
     service_items_data = load_json(SERVICE_ITEMS_FILE)
     if service_key not in service_items_data:
         service_items_data[service_key] = {'items': {}}
+    
+    if 'items' not in service_items_data[service_key]:
+        service_items_data[service_key]['items'] = {}
 
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Use a set to avoid adding exact duplicates in the same batch
+    unique_new_items = []
+    existing_contents = {item['content'] for item in service_items_data[service_key]['items'].values()}
+    
+    added_count = 0
     for acc_item in accounts_list:
         acc_str = acc_item.strip()
-        if not acc_str:
+        if not acc_str or acc_str in existing_contents:
             continue
 
         item_id = str(uuid.uuid4())
@@ -2257,9 +2266,11 @@ def add_accounts_to_service(service_key: str, accounts_list):
             'content': acc_str,
             'added_at': now_str
         }
+        existing_contents.add(acc_str)
+        added_count += 1
 
     save_json(SERVICE_ITEMS_FILE, service_items_data)
-    logger.info(f"Added {len(accounts_list)} accounts to service {service_key}.")
+    logger.info(f"Added {added_count} unique accounts to service {service_key}.")
     return True
 
 def pop_account_from_service(service_key: str, context: ContextTypes.DEFAULT_TYPE = None, claimed_by_user_id: str = None, claimed_by_username: str = None):
@@ -8807,9 +8818,11 @@ async def handle_admin_message_input(update: Update, context: ContextTypes.DEFAU
                                 for item in temp_extract_dir.rglob('*'):
                                     if item.is_file() and (item.suffix.lower() == '.txt' or not item.suffix):
                                         try:
-                                            content = item.read_text(encoding='utf-8')
-                                            if content.strip():
-                                                contents.append(content.strip())
+                                            # Read file and split into lines (each line is an account)
+                                            file_content = item.read_text(encoding='utf-8')
+                                            lines = [line.strip() for line in file_content.split('\n') if line.strip()]
+                                            for line in lines:
+                                                contents.append(line)
                                                 added_count += 1
                                         except Exception as e_read_item:
                                             logger.error(f"Error reading extracted item {item.name}: {e_read_item}")
@@ -8827,10 +8840,20 @@ async def handle_admin_message_input(update: Update, context: ContextTypes.DEFAU
 
                         elif filename_lower.endswith(".txt"):
                             accounts_to_process = []
-                            with open(downloaded_doc_path, 'r', encoding='utf-8') as f_acc_up:
-                                accounts_to_process = [line.strip() for line in f_acc_up if line.strip()]
+                            try:
+                                # Try reading with utf-8 first, fallback to latin-1
+                                try:
+                                    file_text = downloaded_doc_path.read_text(encoding='utf-8')
+                                except UnicodeDecodeError:
+                                    file_text = downloaded_doc_path.read_text(encoding='latin-1')
+                                
+                                accounts_to_process = [line.strip() for line in file_text.split('\n') if line.strip()]
+                            except Exception as e_txt:
+                                logger.error(f"Error reading TXT file: {e_txt}")
+                                response_message = f"❌ Error reading file: {str(e_txt)}"
 
-                            add_accounts_to_service(service_key, accounts_to_process)
+                            if accounts_to_process:
+                                add_accounts_to_service(service_key, accounts_to_process)
                             added_count = len(accounts_to_process)
                             if added_count > 0:
                                 response_message = f"✅ Added {added_count} items from TXT to '{s_info['text']}'."
