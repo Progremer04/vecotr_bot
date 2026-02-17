@@ -25,7 +25,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           filters)
 
 # ------------------ CONFIGURATION ------------------
-BOT_TOKEN = '8595445360:AAGDS1yg-jFEAyQUUfsWZo27WGZ-dgFcn7I'
+BOT_TOKEN = '8595445360:AAF7nYAsFILEY5QHm81nCf_STxzF13qQlRg'
 PRIMARY_ADMIN_USERNAME = 'allicheamine2'
 
 # ------------------ PATHS ------------------
